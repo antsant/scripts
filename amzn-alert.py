@@ -2,6 +2,7 @@
 from bs4 import BeautifulSoup
 
 import argparse
+import re
 import urllib3
 
 parser = argparse.ArgumentParser(description="Send an e-mail alart when an item is found on Amazon.com")
@@ -18,5 +19,7 @@ http = urllib3.PoolManager()
 html = http.request('GET', search_url).data
 
 soup = BeautifulSoup(html, 'lxml')
-
-
+results = soup.find(id="s-results-list-atf")
+for result in results.find_all('h2', string=re.compile(search_term)):
+    # TODO - send e-mail instead of printing
+    print(result.parent['href'])
