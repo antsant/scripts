@@ -1,6 +1,8 @@
 #/usr/bin/python
 import argparse
 import boto
+import boto.ses
+import os
 import re
 import sys
 import urllib3
@@ -8,7 +10,7 @@ import urllib3
 from boto.dynamodb2.exceptions import ItemNotFound
 from boto.dynamodb2.fields import HashKey, RangeKey
 from boto.dynamodb2.table import Table
-from boto.iam.connection import IAMConnection
+from boto.ses.connection import SESConnection
 from bs4 import BeautifulSoup
 
 parser = argparse.ArgumentParser(description="Send an e-mail alart when an item is found on Amazon.com")
@@ -37,6 +39,20 @@ html = http.request('GET', search_url).data
 
 soup = BeautifulSoup(html, 'lxml')
 results = soup.find(id="s-results-list-atf")
+email_body = None
 for result in results.find_all('h2', string=re.compile(search_term)):
-    # TODO - send e-mail instead of printing
-    print(result.parent['href'])
+    link = result.parent['href']
+    email_body = "Item link: " + link + "\n\nSearch page: " + search_url
+    continue    
+ 
+if email_body is not None:
+    smtp_conn = boto.ses.connect_to_region('us-west-2')
+    smtp_conn.send_email(
+	'anthony.a.santos@gmail.com',
+	'Found ' + search_term + ' on Amazon!',
+	email_body,
+	[recipient])
+    searches_notified_table.put_item(data={
+		'Recipient': recipient,
+		'SearchTerm': search_term
+	})
