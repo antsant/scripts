@@ -1,11 +1,15 @@
 #/usr/bin/python
+import argparse
+import boto
+import re
+import sys
+import urllib3
+
+from boto.dynamodb2.exceptions import ItemNotFound
 from boto.dynamodb2.fields import HashKey, RangeKey
 from boto.dynamodb2.table import Table
+from boto.iam.connection import IAMConnection
 from bs4 import BeautifulSoup
-
-import argparse
-import re
-import urllib3
 
 parser = argparse.ArgumentParser(description="Send an e-mail alart when an item is found on Amazon.com")
 parser.add_argument('--name', metavar="SEARCH_TERM", required=True)
@@ -19,8 +23,12 @@ searches_notified_table = Table('SearchesNotified', schema=[
                 HashKey('Recipient'),
                 RangeKey('SearchTerm')
         ])
-is_notified = searches_notified_table.get_item(Recipient=recipient, SearchTerm=search_term)
-print(is_notified)
+try:
+    searches_notified_table.get_item(Recipient=recipient, SearchTerm=search_term)
+    print("Already notified " + recipient + " for the search term " + search_term + ". Quitting.")
+    sys.exit()
+except ItemNotFound:
+    pass
 
 search_url = "http://www.amazon.com/s/ref=nb_sb_noss?url=search-alias%3Daps&field-keywords=" + search_term + "+"
 
