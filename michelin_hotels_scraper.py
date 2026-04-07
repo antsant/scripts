@@ -6,7 +6,7 @@ limitations of simple HTTP scrapers on guide.michelin.com.
 
 Usage examples:
   python michelin_hotels_scraper.py --country us --language en --max-hotels 200
-  python michelin_hotels_scraper.py --all-countries --max-hotels 0
+  python michelin_hotels_scraper.py --all-countries --languages en,es,fr --max-hotels 0
 """
 
 from __future__ import annotations
@@ -76,7 +76,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-countries",
         action="store_true",
-        help="Discover locales and scrape hotels for every country/language combo",
+        help="Sweep 2-letter country codes and probe supported locales before scraping",
+    )
+    parser.add_argument(
+        "--languages",
+        default="en,es,fr,it,de,pt,ja,ko,zh,th",
+        help="Comma-separated language codes to probe per country when --all-countries is set",
     )
     parser.add_argument("--max-pages", type=int, default=500, help="Max listing pages to scan")
     parser.add_argument("--max-hotels", type=int, default=0, help="Stop after N hotels (0 = no limit)")
@@ -149,6 +154,30 @@ async def collect_hotel_urls(page: Page, max_pages: int, max_hotels: int) -> lis
     if max_hotels:
         return ordered[:max_hotels]
     return ordered
+
+
+def parse_languages(raw: str) -> list[str]:
+    values = [value.strip().lower() for value in raw.split(",")]
+    return [value for value in values if value and re.fullmatch(r"[a-z]{2}", value)]
+
+
+async def find_supported_locales(context: BrowserContext, languages: list[str], timeout_ms: int) -> list[str]:
+    locales: list[str] = []
+    for country in ISO_ALPHA2_COUNTRY_CODES:
+        for language in languages:
+            url = f"{BASE_URL}/{country}/{language}/hotels-stays"
+            try:
+                response = await context.request.get(url, timeout=timeout_ms)
+            except Error:
+                continue
+            if response.status != 200:
+                continue
+            final_url = response.url.lower()
+            if "404" in final_url or "not-found" in final_url:
+                continue
+            locales.append(f"{country}/{language}")
+            break
+    return locales
 
 
 def parse_jsonld_objects(raw_html: str) -> list[dict[str, Any]]:
@@ -258,7 +287,12 @@ async def scrape_locale(context: BrowserContext, args: argparse.Namespace, local
 
     listing_url = f"{BASE_URL}/{HOTELS_PATH.format(country=country, language=language)}"
     print(f"[start] locale={locale} {listing_url}")
-    await listing_page.goto(listing_url, wait_until="domcontentloaded")
+    response = await listing_page.goto(listing_url, wait_until="domcontentloaded")
+    if not response or response.status >= 400:
+        status = response.status if response else "no-response"
+        print(f"[skip] locale={locale} listing_status={status}")
+        await listing_page.close()
+        return []
     await accept_cookie_banner(listing_page)
 
     urls = await collect_hotel_urls(listing_page, args.max_pages, args.max_hotels)
@@ -284,8 +318,11 @@ async def scrape_locale(context: BrowserContext, args: argparse.Namespace, local
 async def scrape_all(context: BrowserContext, args: argparse.Namespace) -> list[Hotel]:
     locales = [f"{args.country}/{args.language}"]
     if args.all_countries:
-        locales = [f"{country}/{args.language}" for country in ISO_ALPHA2_COUNTRY_CODES]
-        print(f"[locales] from_iso_country_codes={len(locales)}")
+        languages = parse_languages(args.languages)
+        if not languages:
+            languages = [args.language.lower()]
+        locales = await find_supported_locales(context, languages, args.timeout_ms)
+        print(f"[locales] supported={len(locales)} from_countries={len(ISO_ALPHA2_COUNTRY_CODES)}")
 
     hotels: list[Hotel] = []
     seen_urls: set[str] = set()
