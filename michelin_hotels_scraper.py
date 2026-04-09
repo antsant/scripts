@@ -6,7 +6,7 @@ limitations of simple HTTP scrapers on guide.michelin.com.
 
 Usage examples:
   python michelin_hotels_scraper.py --country us --language en --max-hotels 200
-  python michelin_hotels_scraper.py --all-countries --languages en,es,fr --max-hotels 0
+  python michelin_hotels_scraper.py --all-countries --search-letters abcdefghijklmnopqrstuvwxyz
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import asyncio
 import csv
 import json
 import re
+import string
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,24 +31,6 @@ NEXT_BUTTON_SELECTORS = [
     "button[aria-label='Next']",
     "button:has-text('Next')",
     "a[rel='next']",
-]
-ISO_ALPHA2_COUNTRY_CODES = [
-    "ad", "ae", "af", "ag", "ai", "al", "am", "ao", "aq", "ar", "as", "at", "au", "aw", "ax", "az",
-    "ba", "bb", "bd", "be", "bf", "bg", "bh", "bi", "bj", "bl", "bm", "bn", "bo", "bq", "br", "bs",
-    "bt", "bv", "bw", "by", "bz", "ca", "cc", "cd", "cf", "cg", "ch", "ci", "ck", "cl", "cm", "cn",
-    "co", "cr", "cu", "cv", "cw", "cx", "cy", "cz", "de", "dj", "dk", "dm", "do", "dz", "ec", "ee",
-    "eg", "eh", "er", "es", "et", "fi", "fj", "fk", "fm", "fo", "fr", "ga", "gb", "gd", "ge", "gf",
-    "gg", "gh", "gi", "gl", "gm", "gn", "gp", "gq", "gr", "gs", "gt", "gu", "gw", "gy", "hk", "hm",
-    "hn", "hr", "ht", "hu", "id", "ie", "il", "im", "in", "io", "iq", "ir", "is", "it", "je", "jm",
-    "jo", "jp", "ke", "kg", "kh", "ki", "km", "kn", "kp", "kr", "kw", "ky", "kz", "la", "lb", "lc",
-    "li", "lk", "lr", "ls", "lt", "lu", "lv", "ly", "ma", "mc", "md", "me", "mf", "mg", "mh", "mk",
-    "ml", "mm", "mn", "mo", "mp", "mq", "mr", "ms", "mt", "mu", "mv", "mw", "mx", "my", "mz", "na",
-    "nc", "ne", "nf", "ng", "ni", "nl", "no", "np", "nr", "nu", "nz", "om", "pa", "pe", "pf", "pg",
-    "ph", "pk", "pl", "pm", "pn", "pr", "ps", "pt", "pw", "py", "qa", "re", "ro", "rs", "ru", "rw",
-    "sa", "sb", "sc", "sd", "se", "sg", "sh", "si", "sj", "sk", "sl", "sm", "sn", "so", "sr", "ss",
-    "st", "sv", "sx", "sy", "sz", "tc", "td", "tf", "tg", "th", "tj", "tk", "tl", "tm", "tn", "to",
-    "tr", "tt", "tv", "tw", "tz", "ua", "ug", "um", "us", "uy", "uz", "va", "vc", "ve", "vg", "vi",
-    "vn", "vu", "wf", "ws", "ye", "yt", "za", "zm", "zw",
 ]
 
 
@@ -76,12 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-countries",
         action="store_true",
-        help="Sweep 2-letter country codes and probe supported locales before scraping",
-    )
-    parser.add_argument(
-        "--languages",
-        default="en,es,fr,it,de,pt,ja,ko,zh,th",
-        help="Comma-separated language codes to probe per country when --all-countries is set",
+        help="Use search seeding (a-z) to discover hotels across countries, then scrape details",
     )
     parser.add_argument("--max-pages", type=int, default=500, help="Max listing pages to scan")
     parser.add_argument("--max-hotels", type=int, default=0, help="Stop after N hotels (0 = no limit)")
@@ -89,6 +67,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv", default="michelin_hotels.csv", help="CSV output file")
     parser.add_argument("--timeout-ms", type=int, default=45000, help="Playwright timeout")
     parser.add_argument("--headful", action="store_true", help="Run browser in headed mode")
+    parser.add_argument(
+        "--search-letters",
+        default=string.ascii_lowercase,
+        help="Characters used to seed search discovery (default: a-z)",
+    )
+    parser.add_argument(
+        "--max-search-pages",
+        type=int,
+        default=20,
+        help="Maximum search result pages to traverse per seed letter",
+    )
+    parser.add_argument(
+        "--search-url-template",
+        default=f"{BASE_URL}" + "/{country}/{language}/search?q={query}",
+        help="Template for search page URL; supports {country}, {language}, {query}",
+    )
     return parser.parse_args()
 
 
@@ -156,28 +150,136 @@ async def collect_hotel_urls(page: Page, max_pages: int, max_hotels: int) -> lis
     return ordered
 
 
-def parse_languages(raw: str) -> list[str]:
-    values = [value.strip().lower() for value in raw.split(",")]
-    return [value for value in values if value and re.fullmatch(r"[a-z]{2}", value)]
+def infer_locale_from_url(url: str, fallback: str) -> str:
+    match = re.search(r"guide\\.michelin\\.com/([a-z]{2}/[a-z]{2})/", url)
+    return match.group(1) if match else fallback
 
 
-async def find_supported_locales(context: BrowserContext, languages: list[str], timeout_ms: int) -> list[str]:
-    locales: list[str] = []
-    for country in ISO_ALPHA2_COUNTRY_CODES:
-        for language in languages:
-            url = f"{BASE_URL}/{country}/{language}/hotels-stays"
-            try:
-                response = await context.request.get(url, timeout=timeout_ms)
-            except Error:
+def infer_stars_from_text(text: str | None) -> float | None:
+    if not text:
+        return None
+    match = re.search(r"(\\d(?:\\.\\d)?)\\s*(?:star|stars)\\b", text.lower())
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+async def extract_hotels_from_current_page(
+    page: Page,
+    fallback_locale: str,
+    seen_urls: set[str],
+) -> list[Hotel]:
+    hotels: list[Hotel] = []
+    links = page.locator(CARD_LINK_SELECTOR)
+    count = await links.count()
+    for i in range(count):
+        link = links.nth(i)
+        href = await link.get_attribute("href")
+        if not href:
+            continue
+        absolute = href if href.startswith("http") else f"{BASE_URL}{href}"
+        if "/hotel/" not in absolute and "/hotel-stay/" not in absolute:
+            continue
+        absolute = absolute.split("?")[0].rstrip("/")
+        if absolute in seen_urls:
+            continue
+        seen_urls.add(absolute)
+
+        name = await link.inner_text()
+        if not name:
+            name = await link.get_attribute("title")
+        if not name:
+            name = await link.get_attribute("aria-label")
+        name = normalize_text(name)
+
+        card = link.locator("xpath=ancestor::*[self::article or self::li or @role='article'][1]")
+        card_text = None
+        try:
+            card_text = normalize_text(await card.inner_text(timeout=800))
+        except Error:
+            card_text = None
+
+        locale = infer_locale_from_url(absolute, fallback_locale)
+        hotels.append(
+            Hotel(
+                locale=locale,
+                name=name,
+                url=absolute,
+                city=None,
+                country=None,
+                address=None,
+                latitude=None,
+                longitude=None,
+                description=card_text,
+                phone=None,
+                email=None,
+                stars=infer_stars_from_text(card_text),
+                amenities=[],
+                scraped_at_utc=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+    return hotels
+
+
+def parse_search_letters(raw: str) -> list[str]:
+    letters = [ch.lower() for ch in raw if ch.strip()]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for letter in letters:
+        if letter in seen:
+            continue
+        seen.add(letter)
+        deduped.append(letter)
+    return deduped or list(string.ascii_lowercase)
+
+
+async def collect_hotels_from_search_cards(context: BrowserContext, args: argparse.Namespace) -> list[Hotel]:
+    hotels: list[Hotel] = []
+    seen_urls: set[str] = set()
+    page = await context.new_page()
+    page.set_default_timeout(args.timeout_ms)
+    fallback_locale = f"{args.country}/{args.language}"
+    try:
+        for query in parse_search_letters(args.search_letters):
+            search_url = args.search_url_template.format(
+                country=args.country,
+                language=args.language,
+                query=query,
+            )
+            print(f"[search] seed={query} url={search_url}")
+            response = await page.goto(search_url, wait_until="domcontentloaded")
+            if not response or response.status >= 400:
+                status = response.status if response else "no-response"
+                print(f"[search-skip] seed={query} status={status}")
                 continue
-            if response.status != 200:
-                continue
-            final_url = response.url.lower()
-            if "404" in final_url or "not-found" in final_url:
-                continue
-            locales.append(f"{country}/{language}")
-            break
-    return locales
+
+            await accept_cookie_banner(page)
+            for page_num in range(1, args.max_search_pages + 1):
+                page_hotels = await extract_hotels_from_current_page(page, fallback_locale, seen_urls)
+                hotels.extend(page_hotels)
+                print(f"[search-page] seed={query} page={page_num} hotels_seen={len(hotels)}")
+
+                moved = False
+                for selector in NEXT_BUTTON_SELECTORS:
+                    candidate = page.locator(selector).first
+                    try:
+                        if await candidate.is_visible(timeout=800) and await candidate.is_enabled():
+                            await candidate.click()
+                            moved = True
+                            await page.wait_for_timeout(900)
+                            break
+                    except Error:
+                        continue
+                if not moved:
+                    break
+    finally:
+        await page.close()
+    if args.max_hotels:
+        return hotels[: args.max_hotels]
+    return hotels
 
 
 def parse_jsonld_objects(raw_html: str) -> list[dict[str, Any]]:
@@ -316,23 +418,20 @@ async def scrape_locale(context: BrowserContext, args: argparse.Namespace, local
 
 
 async def scrape_all(context: BrowserContext, args: argparse.Namespace) -> list[Hotel]:
-    locales = [f"{args.country}/{args.language}"]
-    if args.all_countries:
-        languages = parse_languages(args.languages)
-        if not languages:
-            languages = [args.language.lower()]
-        locales = await find_supported_locales(context, languages, args.timeout_ms)
-        print(f"[locales] supported={len(locales)} from_countries={len(ISO_ALPHA2_COUNTRY_CODES)}")
-
     hotels: list[Hotel] = []
     seen_urls: set[str] = set()
-    for locale in locales:
-        locale_hotels = await scrape_locale(context, args, locale)
-        for hotel in locale_hotels:
-            if hotel.url in seen_urls:
-                continue
-            seen_urls.add(hotel.url)
-            hotels.append(hotel)
+    if args.all_countries:
+        hotels = await collect_hotels_from_search_cards(context, args)
+        print(f"[search-collected] unique_hotels={len(hotels)}")
+        return hotels
+
+    locale = f"{args.country}/{args.language}"
+    locale_hotels = await scrape_locale(context, args, locale)
+    for hotel in locale_hotels:
+        if hotel.url in seen_urls:
+            continue
+        seen_urls.add(hotel.url)
+        hotels.append(hotel)
     return hotels
 
 
