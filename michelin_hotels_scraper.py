@@ -199,8 +199,9 @@ async def extract_hotels_from_current_page(
     page: Page,
     fallback_locale: str,
     seen_urls: set[str],
-) -> list[Hotel]:
+) -> tuple[list[Hotel], int]:
     hotels: list[Hotel] = []
+    candidate_hotel_links = 0
     links = page.locator(CARD_LINK_SELECTOR)
     count = await links.count()
     for i in range(count):
@@ -211,6 +212,7 @@ async def extract_hotels_from_current_page(
         absolute = href if href.startswith("http") else f"{BASE_URL}{href}"
         if not is_hotel_detail_url(absolute) and "/hotel/" not in absolute and "/hotel-stay/" not in absolute:
             continue
+        candidate_hotel_links += 1
         absolute = absolute.split("?")[0].rstrip("/")
         if absolute in seen_urls:
             continue
@@ -249,7 +251,7 @@ async def extract_hotels_from_current_page(
                 scraped_at_utc=datetime.now(timezone.utc).isoformat(),
             )
         )
-    return hotels
+    return hotels, candidate_hotel_links
 
 
 def parse_search_letters(raw: str) -> list[str]:
@@ -294,8 +296,12 @@ async def collect_hotels_from_search_cards(context: BrowserContext, args: argpar
 
                 if page_num == 1:
                     await accept_cookie_banner(page)
-                page_hotels = await extract_hotels_from_current_page(page, fallback_locale, seen_urls)
-                if not page_hotels:
+                page_hotels, candidate_hotel_links = await extract_hotels_from_current_page(
+                    page,
+                    fallback_locale,
+                    seen_urls,
+                )
+                if candidate_hotel_links == 0:
                     break
                 hotels.extend(page_hotels)
                 print(f"[search-page] seed={query} page={page_num} hotels_seen={len(hotels)}")
