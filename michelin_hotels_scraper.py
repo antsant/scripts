@@ -17,16 +17,23 @@ import csv
 import json
 import re
 import string
+from itertools import product
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from playwright.async_api import BrowserContext, Error, Page, async_playwright
 
 BASE_URL = "https://guide.michelin.com"
 HOTELS_PATH = "{country}/{language}/hotels-stays"
-CARD_LINK_SELECTOR = "a[href*='/hotel/'], a[href*='/hotel-stay/']"
+CARD_LINK_SELECTOR = (
+    "a[href*='/hotel/'], "
+    "a[href*='/hotel-stay/'], "
+    "a[href*='/hotels-stays/'][aria-label^='Open '], "
+    "a[href*='/hotels-stays/'][data-position-x]"
+)
 NEXT_BUTTON_SELECTORS = [
     "button[aria-label='Next']",
     "button:has-text('Next')",
@@ -59,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-countries",
         action="store_true",
-        help="Use search seeding (a-z) to discover hotels across countries, then scrape details",
+        help="Use search seeding to discover hotels across countries",
     )
     parser.add_argument("--max-pages", type=int, default=500, help="Max listing pages to scan")
     parser.add_argument("--max-hotels", type=int, default=0, help="Stop after N hotels (0 = no limit)")
@@ -70,7 +77,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-letters",
         default=string.ascii_lowercase,
-        help="Characters used to seed search discovery (default: a-z)",
+        help="Characters used to build search queries (default: a-z)",
+    )
+    parser.add_argument(
+        "--search-prefix-length",
+        type=int,
+        default=3,
+        help="Length of generated search prefixes (default: 3; e.g. aaa..zzz)",
     )
     parser.add_argument(
         "--max-search-pages",
@@ -80,8 +93,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--search-url-template",
-        default=f"{BASE_URL}" + "/{country}/{language}/search?q={query}",
-        help="Template for search page URL; supports {country}, {language}, {query}",
+        default=(
+            f"{BASE_URL}"
+            + "/{country}/{language}/hotels-stays/page/{page}?q={query}&nA=1&nC=0&nR=1"
+        ),
+        help="Template for search page URL; supports {country}, {language}, {query}, {page}",
     )
     return parser.parse_args()
 
@@ -103,6 +119,18 @@ async def accept_cookie_banner(page: Page) -> None:
             continue
 
 
+def is_hotel_detail_url(url: str) -> bool:
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 5:
+        return False
+    if parts[2] != "hotels-stays":
+        return False
+    if parts[3] in {"page", "search"}:
+        return False
+    return True
+
+
 async def collect_hotel_urls(page: Page, max_pages: int, max_hotels: int) -> list[str]:
     urls: set[str] = set()
 
@@ -116,7 +144,7 @@ async def collect_hotel_urls(page: Page, max_pages: int, max_hotels: int) -> lis
             if not href:
                 continue
             absolute = href if href.startswith("http") else f"{BASE_URL}{href}"
-            if "/hotel/" in absolute or "/hotel-stay/" in absolute:
+            if is_hotel_detail_url(absolute) or "/hotel/" in absolute or "/hotel-stay/" in absolute:
                 urls.add(absolute.split("?")[0].rstrip("/"))
 
         print(f"[listing] page={page_index} hotels_seen={len(urls)}")
@@ -181,7 +209,7 @@ async def extract_hotels_from_current_page(
         if not href:
             continue
         absolute = href if href.startswith("http") else f"{BASE_URL}{href}"
-        if "/hotel/" not in absolute and "/hotel-stay/" not in absolute:
+        if not is_hotel_detail_url(absolute) and "/hotel/" not in absolute and "/hotel-stay/" not in absolute:
             continue
         absolute = absolute.split("?")[0].rstrip("/")
         if absolute in seen_urls:
@@ -225,7 +253,7 @@ async def extract_hotels_from_current_page(
 
 
 def parse_search_letters(raw: str) -> list[str]:
-    letters = [ch.lower() for ch in raw if ch.strip()]
+    letters = [ch.lower() for ch in raw if ch.strip() and ch.isalpha()]
     deduped: list[str] = []
     seen: set[str] = set()
     for letter in letters:
@@ -236,6 +264,12 @@ def parse_search_letters(raw: str) -> list[str]:
     return deduped or list(string.ascii_lowercase)
 
 
+def build_search_queries(raw_letters: str, prefix_length: int) -> list[str]:
+    letters = parse_search_letters(raw_letters)
+    safe_length = max(1, prefix_length)
+    return ["".join(chars) for chars in product(letters, repeat=safe_length)]
+
+
 async def collect_hotels_from_search_cards(context: BrowserContext, args: argparse.Namespace) -> list[Hotel]:
     hotels: list[Hotel] = []
     seen_urls: set[str] = set()
@@ -243,38 +277,30 @@ async def collect_hotels_from_search_cards(context: BrowserContext, args: argpar
     page.set_default_timeout(args.timeout_ms)
     fallback_locale = f"{args.country}/{args.language}"
     try:
-        for query in parse_search_letters(args.search_letters):
-            search_url = args.search_url_template.format(
-                country=args.country,
-                language=args.language,
-                query=query,
-            )
-            print(f"[search] seed={query} url={search_url}")
-            response = await page.goto(search_url, wait_until="domcontentloaded")
-            if not response or response.status >= 400:
-                status = response.status if response else "no-response"
-                print(f"[search-skip] seed={query} status={status}")
-                continue
-
-            await accept_cookie_banner(page)
+        for query in build_search_queries(args.search_letters, args.search_prefix_length):
             for page_num in range(1, args.max_search_pages + 1):
+                search_url = args.search_url_template.format(
+                    country=args.country,
+                    language=args.language,
+                    query=query,
+                    page=page_num,
+                )
+                print(f"[search] seed={query} page={page_num} url={search_url}")
+                response = await page.goto(search_url, wait_until="domcontentloaded")
+                if not response or response.status >= 400:
+                    status = response.status if response else "no-response"
+                    print(f"[search-skip] seed={query} page={page_num} status={status}")
+                    break
+
+                if page_num == 1:
+                    await accept_cookie_banner(page)
                 page_hotels = await extract_hotels_from_current_page(page, fallback_locale, seen_urls)
+                if not page_hotels:
+                    break
                 hotels.extend(page_hotels)
                 print(f"[search-page] seed={query} page={page_num} hotels_seen={len(hotels)}")
-
-                moved = False
-                for selector in NEXT_BUTTON_SELECTORS:
-                    candidate = page.locator(selector).first
-                    try:
-                        if await candidate.is_visible(timeout=800) and await candidate.is_enabled():
-                            await candidate.click()
-                            moved = True
-                            await page.wait_for_timeout(900)
-                            break
-                    except Error:
-                        continue
-                if not moved:
-                    break
+                if args.max_hotels and len(hotels) >= args.max_hotels:
+                    return hotels[: args.max_hotels]
     finally:
         await page.close()
     if args.max_hotels:
