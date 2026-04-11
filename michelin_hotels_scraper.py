@@ -222,7 +222,7 @@ async def extract_hotels_from_current_page(
     page: Page,
     fallback_locale: str,
     seen_urls: set[str],
-) -> tuple[list[Hotel], int]:
+) -> tuple[list[Hotel], set[str]]:
     hotels: list[Hotel] = []
     candidate_urls_on_page: set[str] = set()
     links = page.locator(CARD_LINK_SELECTOR)
@@ -274,7 +274,7 @@ async def extract_hotels_from_current_page(
                 scraped_at_utc=datetime.now(timezone.utc).isoformat(),
             )
         )
-    return hotels, len(candidate_urls_on_page)
+    return hotels, candidate_urls_on_page
 
 
 def parse_search_letters(raw: str) -> list[str]:
@@ -304,6 +304,7 @@ async def collect_hotels_from_search_cards(context: BrowserContext, args: argpar
     try:
         for query in build_search_queries(args.search_letters, args.search_prefix_length):
             seen_result_pages: set[str] = set()
+            seen_urls_for_query: set[str] = set()
             for page_num in range(1, args.max_search_pages + 1):
                 search_url = args.search_url_template.format(
                     country=args.country,
@@ -329,23 +330,27 @@ async def collect_hotels_from_search_cards(context: BrowserContext, args: argpar
 
                 if page_num == 1:
                     await accept_cookie_banner(page)
-                page_hotels, candidate_hotel_links = await extract_hotels_from_current_page(
+                page_hotels, candidate_urls_on_page = await extract_hotels_from_current_page(
                     page,
                     fallback_locale,
                     seen_urls,
                 )
+                candidate_hotel_links = len(candidate_urls_on_page)
                 if candidate_hotel_links == 0:
                     break
+                query_new_urls = candidate_urls_on_page - seen_urls_for_query
+                seen_urls_for_query.update(candidate_urls_on_page)
                 hotels.extend(page_hotels)
                 print(
                     "[search-page] "
                     f"seed={query} page={page_num} "
                     f"new_on_page={len(page_hotels)} "
+                    f"query_new_links={len(query_new_urls)} "
                     f"candidate_links={candidate_hotel_links} "
                     f"hotels_seen={len(hotels)}"
                 )
-                if page_num > 1 and len(page_hotels) == 0:
-                    print(f"[search-stop] seed={query} page={page_num} no_new_hotels")
+                if page_num > 1 and len(query_new_urls) == 0:
+                    print(f"[search-stop] seed={query} page={page_num} no_new_links_for_seed")
                     break
                 if args.max_hotels and len(hotels) >= args.max_hotels:
                     return hotels[: args.max_hotels]
