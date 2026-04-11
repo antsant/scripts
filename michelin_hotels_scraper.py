@@ -119,6 +119,29 @@ async def accept_cookie_banner(page: Page) -> None:
             continue
 
 
+def is_abort_navigation_error(exc: Error) -> bool:
+    message = str(exc)
+    return "ERR_ABORTED" in message or "Navigation failed because page was closed" in message
+
+
+async def goto_with_retries(
+    page: Page,
+    url: str,
+    *,
+    wait_until: str = "domcontentloaded",
+    retries: int = 2,
+) -> Any:
+    for attempt in range(1, retries + 1):
+        try:
+            return await page.goto(url, wait_until=wait_until)
+        except Error as exc:
+            if not is_abort_navigation_error(exc) or attempt == retries:
+                raise
+            print(f"[search-retry] attempt={attempt}/{retries} url={url} reason=ERR_ABORTED")
+            await page.wait_for_timeout(750 * attempt)
+    return None
+
+
 def is_hotel_detail_url(url: str) -> bool:
     parsed = urlparse(url)
     parts = [part for part in parsed.path.split("/") if part]
@@ -201,7 +224,7 @@ async def extract_hotels_from_current_page(
     seen_urls: set[str],
 ) -> tuple[list[Hotel], int]:
     hotels: list[Hotel] = []
-    candidate_hotel_links = 0
+    candidate_urls_on_page: set[str] = set()
     links = page.locator(CARD_LINK_SELECTOR)
     count = await links.count()
     for i in range(count):
@@ -212,8 +235,8 @@ async def extract_hotels_from_current_page(
         absolute = href if href.startswith("http") else f"{BASE_URL}{href}"
         if not is_hotel_detail_url(absolute) and "/hotel/" not in absolute and "/hotel-stay/" not in absolute:
             continue
-        candidate_hotel_links += 1
         absolute = absolute.split("?")[0].rstrip("/")
+        candidate_urls_on_page.add(absolute)
         if absolute in seen_urls:
             continue
         seen_urls.add(absolute)
@@ -251,7 +274,7 @@ async def extract_hotels_from_current_page(
                 scraped_at_utc=datetime.now(timezone.utc).isoformat(),
             )
         )
-    return hotels, candidate_hotel_links
+    return hotels, len(candidate_urls_on_page)
 
 
 def parse_search_letters(raw: str) -> list[str]:
@@ -280,6 +303,7 @@ async def collect_hotels_from_search_cards(context: BrowserContext, args: argpar
     fallback_locale = f"{args.country}/{args.language}"
     try:
         for query in build_search_queries(args.search_letters, args.search_prefix_length):
+            seen_result_pages: set[str] = set()
             for page_num in range(1, args.max_search_pages + 1):
                 search_url = args.search_url_template.format(
                     country=args.country,
@@ -288,11 +312,20 @@ async def collect_hotels_from_search_cards(context: BrowserContext, args: argpar
                     page=page_num,
                 )
                 print(f"[search] seed={query} page={page_num} url={search_url}")
-                response = await page.goto(search_url, wait_until="domcontentloaded")
+                try:
+                    response = await goto_with_retries(page, search_url, wait_until="domcontentloaded")
+                except Error as exc:
+                    print(f"[search-skip] seed={query} page={page_num} navigation_error={exc}")
+                    break
                 if not response or response.status >= 400:
                     status = response.status if response else "no-response"
                     print(f"[search-skip] seed={query} page={page_num} status={status}")
                     break
+                final_url = page.url.split("#")[0]
+                if final_url in seen_result_pages:
+                    print(f"[search-stop] seed={query} page={page_num} repeated_page={final_url}")
+                    break
+                seen_result_pages.add(final_url)
 
                 if page_num == 1:
                     await accept_cookie_banner(page)
@@ -304,7 +337,16 @@ async def collect_hotels_from_search_cards(context: BrowserContext, args: argpar
                 if candidate_hotel_links == 0:
                     break
                 hotels.extend(page_hotels)
-                print(f"[search-page] seed={query} page={page_num} hotels_seen={len(hotels)}")
+                print(
+                    "[search-page] "
+                    f"seed={query} page={page_num} "
+                    f"new_on_page={len(page_hotels)} "
+                    f"candidate_links={candidate_hotel_links} "
+                    f"hotels_seen={len(hotels)}"
+                )
+                if page_num > 1 and len(page_hotels) == 0:
+                    print(f"[search-stop] seed={query} page={page_num} no_new_hotels")
+                    break
                 if args.max_hotels and len(hotels) >= args.max_hotels:
                     return hotels[: args.max_hotels]
     finally:
